@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"hash"
 
-	"github.com/cometbft/cometbft/crypto"
 	cmtsecp256k1 "github.com/cometbft/cometbft/crypto/secp256k1"
 	scalar "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/ethereum/go-ethereum/crypto/secp256k1"
@@ -32,18 +31,13 @@ func (s StealthSuite) Hash(hashInput []byte) []byte {
 	return hashString
 }
 
-// TODO: Combine view and spend keys into one meta address
-// st:eth:0x<spendingKey><viewingKey>
+func (s StealthSuite) GenerateStealthAddress(metaAddr MetaAddress) (stealthAddr, ephPubKey []byte) {
+	viewPubKey, spendPubKey := ParseMetaAddress(metaAddr)
+	ephPrivKey := cmtsecp256k1.GenPrivKey()
 
-func (s StealthSuite) GenerateStealthAddress(viewKey, spendKey []byte) (stealthAddr []byte, ephPubKey crypto.PubKey) {
-	ephSK := cmtsecp256k1.GenPrivKey()
-	ephPK := ephSK.PubKey()
-
-	// S = V*r, where V is view pubkey and r is ephemeral privkey.
-	view_x, view_y := secp256k1.DecompressPubkey(viewKey)
-	spend_x, spend_y := secp256k1.DecompressPubkey(spendKey)
-
-	shared_x, shared_y := s.curve.ScalarMult(view_x, view_y, ephSK)
+	// S = V*r, where V is view public key and r is ephemeral private key.
+	view_x, view_y := secp256k1.DecompressPubkey(viewPubKey)
+	shared_x, shared_y := s.curve.ScalarMult(view_x, view_y, ephPrivKey)
 
 	// Hash the shared secret.
 	sBytes := secp256k1.CompressPubkey(shared_x, shared_y)
@@ -51,25 +45,24 @@ func (s StealthSuite) GenerateStealthAddress(viewKey, spendKey []byte) (stealthA
 
 	// TODO: View tag
 
-	// Multiply the hashed shared secret with the generator point.
-	// stealthPubKey = spendKey + G*hash(S)
+	// stealthPubKey = spendPubKey + G*hash(S)
 	x, y := s.curve.ScalarBaseMult(hash)
-	stealthPK_x, stealthPK_y := s.curve.Add(x, y, spend_x, spend_y)
+	spend_x, spend_y := secp256k1.DecompressPubkey(spendPubKey)
+	stealth_x, stealth_y := s.curve.Add(x, y, spend_x, spend_y)
 
 	// Convert the public key to address.
-	stealthPK := secp256k1.CompressPubkey(stealthPK_x, stealthPK_y)
-	stealthAddr = cmtsecp256k1.PubKey(stealthPK).Address().Bytes()
+	stealthPubKey := secp256k1.CompressPubkey(stealth_x, stealth_y)
+	stealthAddr = cmtsecp256k1.PubKey(stealthPubKey).Address().Bytes()
 
 	// Return the stealth address and the ephemeral public key.
 	// TODO: also return view tag.
-	return stealthAddr, ephPK
+	return stealthAddr, ephPrivKey.PubKey().Bytes()
 }
 
-func (s StealthSuite) CheckStealthAddress(stealthAddr, ephemeralPK, viewingKey, spendPK []byte) bool {
-	// ephemeralPK * viewingKey
-	eph_x, eph_y := secp256k1.DecompressPubkey(ephemeralPK)
-	shared_x, shared_y := s.curve.ScalarMult(eph_x, eph_y, viewingKey)
-	spend_x, spend_y := secp256k1.DecompressPubkey(spendPK)
+func (s StealthSuite) CheckStealthAddress(stealthAddr, ephPubKey, viewPrivKey, spendPubKey []byte) bool {
+	// S = v*R, where v is view private key and R is ephemeral public key.
+	eph_x, eph_y := secp256k1.DecompressPubkey(ephPubKey)
+	shared_x, shared_y := s.curve.ScalarMult(eph_x, eph_y, viewPrivKey)
 
 	// Hash the shared secret.
 	sBytes := secp256k1.CompressPubkey(shared_x, shared_y)
@@ -77,28 +70,29 @@ func (s StealthSuite) CheckStealthAddress(stealthAddr, ephemeralPK, viewingKey, 
 
 	// TODO: View tag check
 
+	// stealthPubKey = spendPubKey + G*hash(S)
 	x, y := s.curve.ScalarBaseMult(hash)
-	stealthPK_x, stealthPK_y := s.curve.Add(x, y, spend_x, spend_y)
-	stealthPK := secp256k1.CompressPubkey(stealthPK_x, stealthPK_y)
-	derivedStealthAddr := cmtsecp256k1.PubKey(stealthPK).Address().Bytes()
+	spend_x, spend_y := secp256k1.DecompressPubkey(spendPubKey)
+	stealth_x, stealth_y := s.curve.Add(x, y, spend_x, spend_y)
 
+	stealthPubKey := secp256k1.CompressPubkey(stealth_x, stealth_y)
+	derivedStealthAddr := cmtsecp256k1.PubKey(stealthPubKey).Address().Bytes()
 	return bytes.Equal(derivedStealthAddr, stealthAddr)
 }
 
-func (s StealthSuite) ComputeStealthKey(stealthAddr, ephemeralPK, viewingKey, spendKey []byte) []byte {
-	// ephemeralPK * viewingKey
-	eph_x, eph_y := secp256k1.DecompressPubkey(ephemeralPK)
-	shared_x, shared_y := s.curve.ScalarMult(eph_x, eph_y, viewingKey)
+func (s StealthSuite) ComputeStealthKey(stealthAddr, ephPubKey, viewPrivKey, spendPrivKey []byte) []byte {
+	// S = v*R, where v is view private key and R is ephemeral public key.
+	eph_x, eph_y := secp256k1.DecompressPubkey(ephPubKey)
+	shared_x, shared_y := s.curve.ScalarMult(eph_x, eph_y, viewPrivKey)
 
 	// Hash the shared secret.
 	sBytes := secp256k1.CompressPubkey(shared_x, shared_y)
 	hash := s.Hash(sBytes)
 
-	// Stealth private key is spendKey + hash
+	// stealthPrivKey = spendPrivKey + hash(S)
 	aScalar, bScalar := new(scalar.ModNScalar), new(scalar.ModNScalar)
-	aScalar.SetByteSlice(spendKey)
+	aScalar.SetByteSlice(spendPrivKey)
 	bScalar.SetByteSlice(hash)
-
 	result := aScalar.Add(bScalar).Bytes()
 	return result[:]
 }
